@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: multiloader-community
+    env: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 10000
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
