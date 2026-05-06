@@ -11,6 +11,10 @@ const path = require('path')
 
 const PORT = process.env.PORT || 47822
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json')
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads')
+
+// Ensure uploads directory exists
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true })
 
 // ── Owner IDs ─────────────────────────────────────────────────────────────────
 const OWNER_USER_IDS = new Set(['1246855922555420734'])
@@ -26,9 +30,25 @@ function loadData() {
     if (!d.messages)      d.messages = []
     if (!d.bans)          d.bans = []
     if (!d.verifiedUsers) d.verifiedUsers = []
+    if (!d.categories)    d.categories = [
+      { id: 'all',       name: 'All Games', locked: false, builtin: true },
+      { id: 'fivem',     name: 'FiveM',     locked: false, builtin: true },
+      { id: 'cs2',       name: 'CS2',       locked: false, builtin: true },
+      { id: 'minecraft', name: 'Minecraft', locked: false, builtin: true },
+      { id: 'roblox',    name: 'Roblox',    locked: false, builtin: true },
+    ]
     return d
   } catch {
-    return { posts: [], files: [], users: [], messages: [], bans: [], verifiedUsers: [] }
+    return {
+      posts: [], files: [], users: [], messages: [], bans: [], verifiedUsers: [],
+      categories: [
+        { id: 'all',       name: 'All Games', locked: false, builtin: true },
+        { id: 'fivem',     name: 'FiveM',     locked: false, builtin: true },
+        { id: 'cs2',       name: 'CS2',       locked: false, builtin: true },
+        { id: 'minecraft', name: 'Minecraft', locked: false, builtin: true },
+        { id: 'roblox',    name: 'Roblox',    locked: false, builtin: true },
+      ]
+    }
   }
 }
 
@@ -98,9 +118,19 @@ async function handleRequest(req, res) {
 
   if (method === 'GET' && url.pathname === '/posts') {
     const game = url.searchParams.get('game')
-    const posts = game && game !== 'All'
-      ? data.posts.filter(p => p.game === game || p.game === 'All Games')
-      : data.posts
+    const excludeNews = url.searchParams.get('excludeNews')
+    let posts = data.posts
+
+    // Filter out news/announcements for the community (games) feed
+    if (excludeNews === 'true') {
+      posts = posts.filter(p => p.game !== 'News' && p.game !== 'Announcements')
+    }
+
+    // Filter by game
+    if (game && game !== 'All' && game !== 'All Games') {
+      posts = posts.filter(p => p.game === game || p.game === 'All Games')
+    }
+
     return json(res, 200, posts.sort((a, b) => {
       if (a.pinned && !b.pinned) return -1
       if (!a.pinned && b.pinned) return 1
@@ -335,6 +365,102 @@ async function handleRequest(req, res) {
     if (msg) msg.read = true
     saveData(data)
     return json(res, 200, { ok: true })
+  }
+
+  // ── File Upload / Download ────────────────────────────────────────────────
+
+  // POST /files/upload  — receives raw binary, returns { fileId, downloadUrl }
+  if (method === 'POST' && url.pathname === '/files/upload') {
+    const fileName = decodeURIComponent(url.searchParams.get('name') ?? 'file')
+    const fileId = `${Date.now()}_${Math.random().toString(36).slice(2)}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`
+    const destPath = path.join(UPLOADS_DIR, fileId)
+
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(destPath)
+      req.pipe(ws)
+      ws.on('finish', resolve)
+      ws.on('error', reject)
+    })
+
+    const stat = fs.statSync(destPath)
+    const buf = fs.readFileSync(destPath)
+    const sha256 = createHash('sha256').update(buf).digest('hex')
+
+    const downloadUrl = `/files/download/${encodeURIComponent(fileId)}`
+    return json(res, 200, { fileId, downloadUrl, fileName, fileSize: stat.size, sha256 })
+  }
+
+  // GET /files/download/:fileId  — streams the file back
+  const dlMatch = url.pathname.match(/^\/files\/download\/(.+)$/)
+  if (method === 'GET' && dlMatch) {
+    const fileId = decodeURIComponent(dlMatch[1])
+    // Prevent path traversal
+    const safeName = path.basename(fileId)
+    const filePath = path.join(UPLOADS_DIR, safeName)
+    if (!fs.existsSync(filePath)) return json(res, 404, { error: 'File not found' })
+    const stat = fs.statSync(filePath)
+    // Extract original filename (everything after the second underscore segment)
+    const parts = safeName.split('_')
+    const originalName = parts.slice(2).join('_') || safeName
+    setCors(res)
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${originalName}"`,
+      'Content-Length': stat.size,
+    })
+    fs.createReadStream(filePath).pipe(res)
+    return
+  }
+
+  // ── Categories ────────────────────────────────────────────────────────────
+
+  // GET /categories
+  if (method === 'GET' && url.pathname === '/categories') {
+    return json(res, 200, data.categories)
+  }
+
+  // POST /categories  (owner only)
+  if (method === 'POST' && url.pathname === '/categories') {
+    const body = JSON.parse(await readBody(req))
+    if (!OWNER_USER_IDS.has(body.requesterId ?? '')) return json(res, 403, { error: 'Forbidden' })
+    const name = (body.name ?? '').trim()
+    if (!name) return json(res, 400, { error: 'Name required' })
+    if (data.categories.find(c => c.name.toLowerCase() === name.toLowerCase()))
+      return json(res, 409, { error: 'Category already exists' })
+    const cat = { id: `cat_${Date.now()}`, name, iconUrl: body.iconUrl ?? '', locked: false, builtin: false }
+    data.categories.push(cat)
+    saveData(data)
+    broadcast('categories:update', data.categories)
+    return json(res, 201, cat)
+  }
+
+  // DELETE /categories/:id  (owner only, non-builtin only)
+  const catDeleteMatch = url.pathname.match(/^\/categories\/([^/]+)$/)
+  if (method === 'DELETE' && catDeleteMatch) {
+    const catId = catDeleteMatch[1]
+    const body = JSON.parse(await readBody(req))
+    if (!OWNER_USER_IDS.has(body.requesterId ?? '')) return json(res, 403, { error: 'Forbidden' })
+    const cat = data.categories.find(c => c.id === catId)
+    if (!cat) return json(res, 404, { error: 'Not found' })
+    if (cat.builtin) return json(res, 400, { error: 'Cannot delete built-in category' })
+    data.categories = data.categories.filter(c => c.id !== catId)
+    saveData(data)
+    broadcast('categories:update', data.categories)
+    return json(res, 200, { ok: true })
+  }
+
+  // POST /categories/:id/lock  (owner only — toggles locked state)
+  const catLockMatch = url.pathname.match(/^\/categories\/([^/]+)\/lock$/)
+  if (method === 'POST' && catLockMatch) {
+    const catId = catLockMatch[1]
+    const body = JSON.parse(await readBody(req))
+    if (!OWNER_USER_IDS.has(body.requesterId ?? '')) return json(res, 403, { error: 'Forbidden' })
+    const cat = data.categories.find(c => c.id === catId)
+    if (!cat) return json(res, 404, { error: 'Not found' })
+    cat.locked = !cat.locked
+    saveData(data)
+    broadcast('categories:update', data.categories)
+    return json(res, 200, { locked: cat.locked })
   }
 
   json(res, 404, { error: 'Not found' })
